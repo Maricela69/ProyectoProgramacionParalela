@@ -1,0 +1,22 @@
+/usr/include/c++/14/bits/stl_vector.h:99:4: optimized: basic block part vectorized using 16 byte vectors
+main.cpp:266:31: optimized: loop vectorized using 16 byte vectors
+main.cpp:266:31: optimized: loop vectorized using 8 byte vectors
+/usr/include/c++/14/bits/stl_vector.h:99:4: optimized: basic block part vectorized using 16 byte vectors
+main.cpp:213:20: optimized: loop vectorized using 16 byte vectors
+main.cpp:343:8: optimized: basic block part vectorized using 2 byte vectors
+main.cpp:343:8: optimized: basic block part vectorized using 16 byte vectors
+main.cpp:88:27: optimized: basic block part vectorized using 8 byte vectors
+main.cpp:144:13: optimized: basic block part vectorized using 16 byte vectors
+main.cpp:88:27: optimized: basic block part vectorized using 8 byte vectors
+main.cpp:174:11: optimized: basic block part vectorized using 16 byte vectors
+/usr/include/c++/14/bits/stl_vector.h:99:4: optimized: basic block part vectorized using 16 byte vectors
+/usr/include/c++/14/bits/stl_vector.h:99:4: optimized: basic block part vectorized using 16 byte vectors
+/usr/include/c++/14/bits/stl_vector.h:99:4: optimized: basic block part vectorized using 16 byte vectors
+main.cpp:183:17: optimized: basic block part vectorized using 16 byte vectors
+main.cpp:239:13: optimized: basic block part vectorized using 16 byte vectors
+main.cpp:239:13: optimized: basic block part vectorized using 16 byte vectors
+main.cpp:88:27: optimized: basic block part vectorized using 8 byte vectors
+main.cpp:304:13: optimized: basic block part vectorized using 16 byte vectors
+main.cpp:304:13: optimized: basic block part vectorized using 16 byte vectors
+main.cpp:316:13: optimized: basic block part vectorized using 8 byte vectors
+main.cpp:316:13: optimized: basic block part vectorized using 16 byte vectors
