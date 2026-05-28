@@ -1,40 +1,59 @@
 // =============================================================================
-//  fractal_proc_omp — Versión PARALELA con OpenMP del programa secuencial.
+//  main_omp_simd.cpp — Version VECTORIZADA (SPMD) de main_omp.cpp
 // -----------------------------------------------------------------------------
-//  Cambios respecto a main.cpp (puramente secuencial):
+//  Objetivo 2 reescrito para FORZAR la vectorizacion del bucle mas interno
+//  de los filtros de convolucion usando estructuras SPMD de OpenMP:
 //
-//    1. #include <omp.h>  (con guardas para que compile aunque OpenMP esté
-//       desactivado: en ese caso se comporta como el secuencial).
+//      #pragma omp simd          (cada lane SIMD = un pixel de salida)
 //
-//    2. Tres directivas #pragma omp parallel for, una en cada bucle pesado:
-//         - Mandelbrot      -> schedule(dynamic, 16)  (carga desigual)
-//         - Gaussiana 2D    -> schedule(static)       (carga uniforme)
-//         - Sobel           -> schedule(static)       (carga uniforme)
+//  combinado con el paralelismo de hilos ya existente:
 //
-//    3. Se reemplazo el reporte de progreso fila a fila (que provocaba
-//       race conditions y contencion en std::cout) por un contador atomico
-//       de filas terminadas que solo imprime cuando avanza un 1%.
+//      #pragma omp parallel for  (cada hilo = un bloque de filas)
 //
-//    4. Nuevo flag -t / --threads N para fijar manualmente el numero de
-//       hilos (equivalente a la variable de entorno OMP_NUM_THREADS).
+//  -> Modelo hibrido: hilos en el eje Y, lanes SIMD en el eje X.
 //
-//    5. Se reporta cuantos hilos OpenMP estan activos y se calcula el
-//       "speedup observado" si el usuario corre antes la version secuencial.
+// -----------------------------------------------------------------------------
+//  POR QUE EL CODIGO ORIGINAL NO VECTORIZABA BIEN
+//  -----------------------------------------------
+//  El convolve2D original tenia 3 obstaculos en el bucle interno:
+//    1) clamp-to-edge con ramas  (if sx<0 ... else if ...) -> control de flujo
+//       dependiente de datos, que impide al vectorizador.
+//    2) acceso RGB intercalado (stride 3) -> cargas tipo "gather", no contiguas.
+//    3) reduccion sobre la ventana con direccionamiento irregular.
 //
-//  El resto del codigo (matematica del fractal, kernel Gaussiano, Sobel,
-//  formato PPM, parseo de argumentos, paleta de colores) es identico a la
-//  version secuencial: los comentarios explicativos no se repiten aqui en
-//  detalle, ver main.cpp para la teoria completa.
+//  SOLUCION (estructura SPMD-friendly):
+//    A) Separar canales en planos contiguos (planar R, G, B) -> cargas
+//       vectoriales unitarias (stride 1).
+//    B) Pre-rellenar la imagen con un borde de tamano 'radius' replicando el
+//       borde (padding). Asi el bucle interno NO tiene ninguna rama de limites.
+//    C) Reordenar el bucle: para cada peso del kernel (j,i), acumular sobre
+//       TODA la fila de salida:  acc[x] += w * P[(y+j)*PW + (x+i)].
+//       El acceso P[... + x + i] es CONTIGUO en x -> AXPY perfecta para SIMD.
 //
-//  Compilacion:
-//      Linux  : g++ -O3 -fopenmp -std=c++17 -march=native main_omp.cpp -o fractal_omp
-//      Windows: g++ -O3 -fopenmp -std=c++17 -march=native main_omp.cpp -o fractal_omp.exe
-//      MSVC   : cl /O2 /openmp /std:c++17 /EHsc main_omp.cpp
+//  Resultado: el bucle interno es un multiply-add contiguo sin ramas, que el
+//  compilador convierte en instrucciones FMA de AVX2/AVX-512.
 //
-//  Para forzar un numero de hilos especifico:
-//      ./fractal_omp -t 8
-//    o bien:
-//      OMP_NUM_THREADS=8 ./fractal_omp
+// -----------------------------------------------------------------------------
+//  COMPILACION (con verificacion de vectorizacion) — ver SIMD.md para detalle.
+//
+//    GCC  (recomendado):
+//      g++ -O3 -fopenmp -march=native -std=c++17 \
+//          -fopt-info-vec-optimized=vec.txt main_omp_simd.cpp -o fractal_simd
+//      # luego:  grep "convolve\|sobel\|simd" vec.txt   (o revisar vec.txt)
+//
+//    Clang:
+//      clang++ -O3 -fopenmp -march=native -std=c++17 \
+//          -Rpass=loop-vectorize -Rpass-missed=loop-vectorize \
+//          main_omp_simd.cpp -o fractal_simd 2> vec.txt
+//
+//    MSVC:
+//      cl /O2 /openmp:experimental /arch:AVX2 /Qvec-report:2 /std:c++17 main_omp_simd.cpp
+//
+//  BANDERAS CLAVE:
+//    -O3            : habilita el auto-vectorizador (imprescindible).
+//    -march=native  : permite usar AVX2/AVX-512/FMA de TU CPU.
+//    -fopenmp       : activa #pragma omp parallel for Y #pragma omp simd.
+//    (-fopenmp-simd : si solo quieres los pragmas simd sin el runtime de hilos)
 // =============================================================================
 
 #include <algorithm>
@@ -50,11 +69,9 @@
 #include <string>
 #include <vector>
 
-// ---- OpenMP con fallback graceful si no esta disponible ---------------------
 #ifdef _OPENMP
   #include <omp.h>
 #else
-  // Stubs para que el codigo siga compilando sin -fopenmp.
   inline int  omp_get_max_threads() { return 1; }
   inline int  omp_get_num_threads() { return 1; }
   inline int  omp_get_thread_num()  { return 0; }
@@ -62,39 +79,27 @@
 #endif
 
 // -----------------------------------------------------------------------------
-// 1) ESTRUCTURA DE IMAGEN  (identica a la version secuencial)
+// 1) IMAGEN (RGB intercalado, igual que antes — es el formato de E/S)
 // -----------------------------------------------------------------------------
 struct Image {
-    int width  = 0;
-    int height = 0;
+    int width = 0, height = 0;
     std::vector<uint8_t> data;
-
     Image() = default;
-    Image(int w, int h) : width(w), height(h), data(static_cast<size_t>(w) * h * 3, 0) {}
-
+    Image(int w, int h) : width(w), height(h),
+                          data(static_cast<size_t>(w) * h * 3, 0) {}
     inline void setPixel(int x, int y, uint8_t r, uint8_t g, uint8_t b) {
         size_t idx = (static_cast<size_t>(y) * width + x) * 3;
-        data[idx + 0] = r;
-        data[idx + 1] = g;
-        data[idx + 2] = b;
+        data[idx + 0] = r; data[idx + 1] = g; data[idx + 2] = b;
     }
     inline void getPixel(int x, int y, uint8_t& r, uint8_t& g, uint8_t& b) const {
         size_t idx = (static_cast<size_t>(y) * width + x) * 3;
-        r = data[idx + 0];
-        g = data[idx + 1];
-        b = data[idx + 2];
+        r = data[idx + 0]; g = data[idx + 1]; b = data[idx + 2];
     }
 };
 
-// -----------------------------------------------------------------------------
-// 2) GUARDADO PPM  (no se paraleliza: dominado por IO)
-// -----------------------------------------------------------------------------
 static bool savePPM(const Image& img, const std::string& filename) {
     std::ofstream out(filename, std::ios::binary);
-    if (!out) {
-        std::cerr << "ERROR: no se pudo abrir " << filename << "\n";
-        return false;
-    }
+    if (!out) { std::cerr << "ERROR abriendo " << filename << "\n"; return false; }
     out << "P6\n" << img.width << " " << img.height << "\n255\n";
     out.write(reinterpret_cast<const char*>(img.data.data()),
               static_cast<std::streamsize>(img.data.size()));
@@ -102,26 +107,23 @@ static bool savePPM(const Image& img, const std::string& filename) {
 }
 
 // -----------------------------------------------------------------------------
-// 3) MANDELBROT: iteracion por pixel  (identica)
+// 2) MANDELBROT (sin cambios respecto a main_omp.cpp)
 // -----------------------------------------------------------------------------
 static inline int mandelbrotIterations(double cr, double ci, int maxIter) {
-    double zr = 0.0, zi = 0.0;
-    double zr2 = 0.0, zi2 = 0.0;
+    double zr = 0.0, zi = 0.0, zr2 = 0.0, zi2 = 0.0;
     int iter = 0;
     while (iter < maxIter && (zr2 + zi2) <= 4.0) {
-        zi  = 2.0 * zr * zi + ci;   // parte imaginaria nueva
-        zr  = zr2 - zi2 + cr;       // parte real nueva
-        zr2 = zr * zr;
-        zi2 = zi * zi;
+        zi = 2.0 * zr * zi + ci;
+        zr = zr2 - zi2 + cr;
+        zr2 = zr * zr; zi2 = zi * zi;
         ++iter;
     }
     return iter;
 }
-
 static inline void iterToColor(int iter, int maxIter,
                                uint8_t& r, uint8_t& g, uint8_t& b) {
     if (iter >= maxIter) { r = g = b = 0; return; }
-    double t = static_cast<double>(iter) / static_cast<double>(maxIter);
+    double t = static_cast<double>(iter) / maxIter;
     double R = 9.0  * (1 - t) * t * t * t;
     double G = 15.0 * (1 - t) * (1 - t) * t * t;
     double B = 8.5  * (1 - t) * (1 - t) * (1 - t) * t;
@@ -130,370 +132,326 @@ static inline void iterToColor(int iter, int maxIter,
     b = static_cast<uint8_t>(std::min(255.0, B * 255.0));
 }
 
-// -----------------------------------------------------------------------------
-// 4) PROGRESO THREAD-SAFE (contador atomico)
-// -----------------------------------------------------------------------------
-// En la version secuencial usabamos una variable lastPct local. En paralelo
-// hay que actualizar y leer un contador desde varios hilos, asi que usamos
-// std::atomic<int>. SOLO el thread 0 imprime para no saturar la salida.
-// -----------------------------------------------------------------------------
-struct Progress {
-    std::atomic<int> done{0};
-    int total = 0;
-    int lastPct = -1;
-    const char* label = "";
-
-    explicit Progress(int totalRows, const char* lbl) : total(totalRows), label(lbl) {}
-
-    inline void tickAndMaybePrint() {
-        int d = done.fetch_add(1, std::memory_order_relaxed) + 1;
-        // Solo el hilo 0 escribe a stdout. Otros hilos solo incrementan el contador.
-        if (omp_get_thread_num() == 0) {
-            int pct = static_cast<int>((100LL * d) / total);
-            if (pct != lastPct) {
-                std::cout << "  " << label << ": " << pct << "%\r" << std::flush;
-                lastPct = pct;
-            }
-        }
-    }
-    inline void finish() {
-        std::cout << "  " << label << ": 100%   \n";
-    }
-};
-
-// -----------------------------------------------------------------------------
-// 5) GENERAR MANDELBROT EN PARALELO
-// -----------------------------------------------------------------------------
-// JUSTIFICACION DEL SCHEDULE:
-//   La carga de trabajo por fila es MUY desigual: las filas que cruzan el
-//   conjunto contienen pixeles que iteran hasta MAX_ITER, mientras que las
-//   filas en las esquinas escapan en pocas iteraciones. Con schedule(static)
-//   algunos hilos terminarian al 20% y otros al 100% (desbalanceo grave).
-//
-//   schedule(dynamic, 16) reparte filas en bloques de 16: cuando un hilo
-//   termina su bloque, toma el siguiente disponible. Chunk=16 amortiza el
-//   overhead de la cola dinamica sin desbalancear demasiado.
-// -----------------------------------------------------------------------------
 static void generateMandelbrot(Image& img, int maxIter) {
     const double aspect = static_cast<double>(img.width) / img.height;
-    const double xCenter = -0.5,  yCenter = 0.0;
-    const double xRange  = 3.5;
-    const double yRange  = xRange / aspect;
-    const double xMin    = xCenter - xRange * 0.5;
-    const double yMin    = yCenter - yRange * 0.5;
-    const double dx      = xRange / img.width;
-    const double dy      = yRange / img.height;
-    (void)yCenter;  // ya incorporado a yMin
+    const double xRange = 3.5, xCenter = -0.5;
+    const double yRange = xRange / aspect;
+    const double xMin = xCenter - xRange * 0.5;
+    const double yMin = -yRange * 0.5;
+    const double dx = xRange / img.width;
+    const double dy = yRange / img.height;
 
-    Progress prog(img.height, "Mandelbrot");
-
-    // -------- ZONA PARALELA --------
     #pragma omp parallel for schedule(dynamic, 16) default(none) \
-            shared(img, prog) firstprivate(maxIter, xMin, yMin, dx, dy)
+            shared(img) firstprivate(maxIter, xMin, yMin, dx, dy)
     for (int y = 0; y < img.height; ++y) {
         const double ci = yMin + y * dy;
         for (int x = 0; x < img.width; ++x) {
-            const double cr = xMin + x * dx;
-            int iter = mandelbrotIterations(cr, ci, maxIter);
+            int iter = mandelbrotIterations(xMin + x * dx, ci, maxIter);
             uint8_t r, g, b;
             iterToColor(iter, maxIter, r, g, b);
             img.setPixel(x, y, r, g, b);
         }
-        prog.tickAndMaybePrint();
     }
-    // -------- FIN ZONA PARALELA ----
-    prog.finish();
 }
 
 // -----------------------------------------------------------------------------
-// 6) KERNEL GAUSSIANO  (no se paraleliza: kernel pequeno y se calcula 1 vez)
+// 3) PLANOS PLANARES CON PADDING (la clave de la vectorizacion)
 // -----------------------------------------------------------------------------
-static std::vector<double> gaussianKernel(int radius, double sigma) {
-    const int size = 2 * radius + 1;
-    std::vector<double> kernel(static_cast<size_t>(size) * size);
-    double sum = 0.0;
-    const double s2 = 2.0 * sigma * sigma;
-    for (int j = -radius; j <= radius; ++j) {
-        for (int i = -radius; i <= radius; ++i) {
-            double v = std::exp(-(i * i + j * j) / s2);
-            kernel[(j + radius) * size + (i + radius)] = v;
-            sum += v;
+// Convierte la imagen RGB intercalada en 3 planos float contiguos (R, G, B),
+// cada uno rodeado por un borde de 'radius' pixeles replicando el borde
+// (clamp-to-edge). Asi el bucle de convolucion NO necesita comprobar limites.
+//
+//   Dimensiones del plano con padding:
+//     PW = width  + 2*radius
+//     PH = height + 2*radius
+//   El pixel de imagen (x,y) vive en el plano en (x + radius, y + radius).
+// -----------------------------------------------------------------------------
+struct PaddedPlanesF {
+    int W, H, r, PW, PH;
+    std::vector<float> R, G, B;
+
+    PaddedPlanesF(const Image& img, int radius)
+        : W(img.width), H(img.height), r(radius),
+          PW(img.width + 2 * radius), PH(img.height + 2 * radius),
+          R(static_cast<size_t>(PW) * PH),
+          G(static_cast<size_t>(PW) * PH),
+          B(static_cast<size_t>(PW) * PH)
+    {
+        // Rellenar TODOS los pixeles del plano (incluido el borde) con el
+        // valor de imagen mas cercano (clamp). El clamp se hace AQUI, una sola
+        // vez, fuera del hot-loop.
+        #pragma omp parallel for schedule(static) default(none) shared(img)
+        for (int py = 0; py < PH; ++py) {
+            int sy = py - r;
+            if (sy < 0) sy = 0; else if (sy >= H) sy = H - 1;
+            for (int px = 0; px < PW; ++px) {
+                int sx = px - r;
+                if (sx < 0) sx = 0; else if (sx >= W) sx = W - 1;
+                uint8_t cr, cg, cb;
+                img.getPixel(sx, sy, cr, cg, cb);
+                size_t idx = static_cast<size_t>(py) * PW + px;
+                R[idx] = cr; G[idx] = cg; B[idx] = cb;
+            }
         }
     }
-    for (auto& v : kernel) v /= sum;
+};
+
+// -----------------------------------------------------------------------------
+// 4) KERNEL GAUSSIANO (float, para coincidir con los planos)
+// -----------------------------------------------------------------------------
+static std::vector<float> gaussianKernelF(int radius, double sigma) {
+    const int size = 2 * radius + 1;
+    std::vector<float> kernel(static_cast<size_t>(size) * size);
+    double sum = 0.0;
+    const double s2 = 2.0 * sigma * sigma;
+    for (int j = -radius; j <= radius; ++j)
+        for (int i = -radius; i <= radius; ++i) {
+            double v = std::exp(-(i * i + j * j) / s2);
+            kernel[(j + radius) * size + (i + radius)] = static_cast<float>(v);
+            sum += v;
+        }
+    for (auto& v : kernel) v = static_cast<float>(v / sum);
     return kernel;
 }
 
 // -----------------------------------------------------------------------------
-// 7) CONVOLUCION 2D EN PARALELO
+// 5) CONVOLUCION 2D VECTORIZADA (SPMD)
 // -----------------------------------------------------------------------------
-// JUSTIFICACION DEL SCHEDULE:
-//   A diferencia del Mandelbrot, cada fila cuesta EXACTAMENTE LO MISMO
-//   (mismo numero de operaciones por pixel, independiente del contenido).
-//   schedule(static) es optimo: minimo overhead de planificacion y reparto
-//   perfectamente balanceado.
+// Estructura de bucles (de fuera a dentro):
+//   parallel for (y)        -> hilos OpenMP, una banda de filas por hilo
+//     for (j) for (i)       -> recorrido de los (2r+1)^2 pesos del kernel
+//       omp simd (x)        -> LANES SIMD: acc[x] += w * P[(y+j)*PW + x+i]
 //
-//   Tambien aprovechamos la localidad: cada hilo procesa filas contiguas,
-//   reusando las lineas de cache del kernel y de las filas vecinas de la
-//   imagen de entrada. Si usaramos dynamic con chunk=1, los hilos saltarian
-//   por la imagen y la tasa de cache miss subiria.
+// El bucle 'x' es el que se vectoriza:
+//   * acc[x] es contiguo (stride 1).
+//   * srcRow[x + i] es contiguo en x (i es constante dentro del simd).
+//   * No hay ramas: el padding garantiza que x+i siempre esta en rango.
+//   => El compilador emite FMA vectoriales (vfmadd...ps en AVX).
 //
-// SEGURIDAD DE THREADING:
-//   - Solo se lee de 'src' (memoria compartida read-only): no hace falta
-//     sincronizacion.
-//   - Cada iteracion escribe en un pixel DISTINTO de 'dst' (separados al
-//     menos por una fila => al menos 3*W bytes => distintas lineas de
-//     cache): no hay false sharing entre filas.
+// Los acumuladores accR/accG/accB son por-hilo (declarados dentro de la region
+// parallel), evitando false sharing y reasignaciones por fila.
 // -----------------------------------------------------------------------------
-static void convolve2D(const Image& src, Image& dst,
-                       const std::vector<double>& kernel, int radius) {
-    const int size = 2 * radius + 1;
-    Progress prog(src.height, "Gaussiana");
+static void convolve2D_simd(const PaddedPlanesF& P, Image& dst,
+                            const std::vector<float>& kernel) {
+    const int W = P.W, H = P.H, r = P.r, PW = P.PW;
+    const int ksize = 2 * r + 1;
 
-    #pragma omp parallel for schedule(static) default(none) \
-            shared(src, dst, kernel, prog) firstprivate(radius, size)
-    for (int y = 0; y < src.height; ++y) {
-        for (int x = 0; x < src.width; ++x) {
-            double accR = 0.0, accG = 0.0, accB = 0.0;
-            for (int ky = -radius; ky <= radius; ++ky) {
-                int sy = y + ky;
-                if (sy < 0) sy = 0;
-                else if (sy >= src.height) sy = src.height - 1;
-                for (int kx = -radius; kx <= radius; ++kx) {
-                    int sx = x + kx;
-                    if (sx < 0) sx = 0;
-                    else if (sx >= src.width) sx = src.width - 1;
-                    double w = kernel[(ky + radius) * size + (kx + radius)];
-                    uint8_t pr, pg, pb;
-                    src.getPixel(sx, sy, pr, pg, pb);
-                    accR += w * pr;
-                    accG += w * pg;
-                    accB += w * pb;
+    #pragma omp parallel default(none) shared(P, dst, kernel) \
+            firstprivate(W, H, r, PW, ksize)
+    {
+        // Acumuladores por hilo (una sola asignacion por hilo).
+        std::vector<float> accR(W), accG(W), accB(W);
+
+        #pragma omp for schedule(static)
+        for (int y = 0; y < H; ++y) {
+            // Reiniciar acumuladores de esta fila.
+            std::fill(accR.begin(), accR.end(), 0.0f);
+            std::fill(accG.begin(), accG.end(), 0.0f);
+            std::fill(accB.begin(), accB.end(), 0.0f);
+
+            // Recorrer los pesos del kernel.
+            for (int j = 0; j < ksize; ++j) {
+                const float* rowR = &P.R[static_cast<size_t>(y + j) * PW];
+                const float* rowG = &P.G[static_cast<size_t>(y + j) * PW];
+                const float* rowB = &P.B[static_cast<size_t>(y + j) * PW];
+                const float* krow = &kernel[static_cast<size_t>(j) * ksize];
+                for (int i = 0; i < ksize; ++i) {
+                    const float w = krow[i];
+                    const float* pr = rowR + i;   // P.R[(y+j)*PW + x + i] al indexar [x]
+                    const float* pg = rowG + i;
+                    const float* pb = rowB + i;
+                    // ----- BUCLE VECTORIZADO (SPMD) -----
+                    #pragma omp simd
+                    for (int x = 0; x < W; ++x) {
+                        accR[x] += w * pr[x];
+                        accG[x] += w * pg[x];
+                        accB[x] += w * pb[x];
+                    }
+                    // ------------------------------------
                 }
             }
-            auto clamp255 = [](double v) -> uint8_t {
-                if (v < 0.0)   return 0;
-                if (v > 255.0) return 255;
-                return static_cast<uint8_t>(v);
-            };
-            dst.setPixel(x, y, clamp255(accR), clamp255(accG), clamp255(accB));
+
+            // Volcar la fila a la imagen de salida con clamp a [0,255].
+            for (int x = 0; x < W; ++x) {
+                auto c = [](float v) -> uint8_t {
+                    if (v < 0.0f) return 0;
+                    if (v > 255.0f) return 255;
+                    return static_cast<uint8_t>(v + 0.5f);
+                };
+                dst.setPixel(x, y, c(accR[x]), c(accG[x]), c(accB[x]));
+            }
         }
-        prog.tickAndMaybePrint();
     }
-    prog.finish();
 }
 
 // -----------------------------------------------------------------------------
-// 8) SOBEL EN PARALELO
+// 6) SOBEL VECTORIZADO (SPMD)
 // -----------------------------------------------------------------------------
-// Mismo razonamiento que la convolucion: coste por fila constante,
-// schedule(static).
+// Se precomputa un plano de LUMINANCIA con padding=1 (float). Luego cada fila
+// de salida se calcula con un bucle 'omp simd' sobre x, leyendo las 3 filas
+// vecinas del plano. Todas las cargas son contiguas y sin ramas.
+//
+//   Gx = [-1 0 1; -2 0 2; -1 0 1]      Gy = [-1 -2 -1; 0 0 0; 1 2 1]
+//   mag = sqrt(gx^2 + gy^2)            (la sqrt tambien se vectoriza)
 // -----------------------------------------------------------------------------
-static void sobelFilter(const Image& src, Image& dst) {
-    static const int Gx[3][3] = {{-1,0,1},{-2,0,2},{-1,0,1}};
-    static const int Gy[3][3] = {{-1,-2,-1},{0,0,0},{1,2,1}};
+static void sobel_simd(const Image& src, Image& dst) {
+    const int W = src.width, H = src.height;
+    const int PW = W + 2;            // padding = 1
+    const int PH = H + 2;
 
-    Progress prog(src.height, "Sobel");
+    // Plano de luminancia con padding (clamp-to-edge), una sola vez.
+    std::vector<float> L(static_cast<size_t>(PW) * PH);
+    #pragma omp parallel for schedule(static) default(none) \
+            shared(src, L) firstprivate(W, H, PW, PH)
+    for (int py = 0; py < PH; ++py) {
+        int sy = py - 1; if (sy < 0) sy = 0; else if (sy >= H) sy = H - 1;
+        for (int px = 0; px < PW; ++px) {
+            int sx = px - 1; if (sx < 0) sx = 0; else if (sx >= W) sx = W - 1;
+            uint8_t r, g, b; src.getPixel(sx, sy, r, g, b);
+            L[static_cast<size_t>(py) * PW + px] =
+                0.299f * r + 0.587f * g + 0.114f * b;
+        }
+    }
 
     #pragma omp parallel for schedule(static) default(none) \
-            shared(src, dst, Gx, Gy, prog)
-    for (int y = 0; y < src.height; ++y) {
-        for (int x = 0; x < src.width; ++x) {
-            double gx = 0.0, gy = 0.0;
-            for (int ky = -1; ky <= 1; ++ky) {
-                int sy = std::clamp(y + ky, 0, src.height - 1);
-                for (int kx = -1; kx <= 1; ++kx) {
-                    int sx = std::clamp(x + kx, 0, src.width - 1);
-                    uint8_t r, g, b;
-                    src.getPixel(sx, sy, r, g, b);
-                    double lum = 0.299 * r + 0.587 * g + 0.114 * b;
-                    gx += Gx[ky + 1][kx + 1] * lum;
-                    gy += Gy[ky + 1][kx + 1] * lum;
-                }
-            }
-            double mag = std::sqrt(gx * gx + gy * gy);
-            uint8_t v = static_cast<uint8_t>(std::min(255.0, mag));
+            shared(L, dst) firstprivate(W, H, PW)
+    for (int y = 0; y < H; ++y) {
+        const float* r0 = &L[static_cast<size_t>(y + 0) * PW];  // fila superior
+        const float* r1 = &L[static_cast<size_t>(y + 1) * PW];  // fila central
+        const float* r2 = &L[static_cast<size_t>(y + 2) * PW];  // fila inferior
+        // ----- BUCLE VECTORIZADO (SPMD) -----
+        #pragma omp simd
+        for (int x = 0; x < W; ++x) {
+            // ventana 3x3: columnas x, x+1, x+2 del plano con padding
+            float gx = -r0[x] + r0[x + 2]
+                     - 2.0f * r1[x] + 2.0f * r1[x + 2]
+                     - r2[x] + r2[x + 2];
+            float gy = -r0[x] - 2.0f * r0[x + 1] - r0[x + 2]
+                     + r2[x] + 2.0f * r2[x + 1] + r2[x + 2];
+            float mag = std::sqrt(gx * gx + gy * gy);
+            if (mag > 255.0f) mag = 255.0f;
+            uint8_t v = static_cast<uint8_t>(mag);
             dst.setPixel(x, y, v, v, v);
         }
-        prog.tickAndMaybePrint();
+        // ------------------------------------
     }
-    prog.finish();
 }
 
 // -----------------------------------------------------------------------------
-// 9) CLI
+// 7) CLI (igual que main_omp.cpp + nada nuevo)
 // -----------------------------------------------------------------------------
 struct Config {
-    int  width    = 7680;
-    int  height   = 4320;
-    int  maxIter  = 1000;
-    int  radius   = 15;
-    int  threads  = 0;        // 0 = automatico (todos los disponibles)
-    bool runBlur  = true;
-    bool runSobel = true;
-    std::string outFractal = "fractal.ppm";
-    std::string outBlur    = "blurred.ppm";
-    std::string outSobel   = "edges.ppm";
+    int width = 7680, height = 4320, maxIter = 1000, radius = 15, threads = 0;
+    bool runBlur = true, runSobel = true;
+    std::string outFractal = "fractal.ppm", outBlur = "blurred.ppm", outSobel = "edges.ppm";
 };
 
-static void printHelp(const char* progname) {
+static void printHelp(const char* p) {
     std::cout <<
-        "Uso: " << progname << " [opciones]\n"
-        "  -w, --width   N    ancho de la imagen           (default 7680)\n"
-        "  -h, --height  N    alto  de la imagen           (default 4320)\n"
-        "  -i, --iter    N    iteraciones max. Mandelbrot  (default 1000)\n"
-        "  -r, --radius  N    radio del kernel Gaussiano   (default 15)\n"
-        "  -t, --threads N    numero de hilos OpenMP       (default: max disponibles)\n"
-        "      --no-blur      omite el desenfoque Gaussiano\n"
-        "      --no-sobel     omite el filtro Sobel\n"
-        "      --help         muestra esta ayuda\n";
+        "Uso: " << p << " [opciones]\n"
+        "  -w N  ancho (7680)   -h N alto (4320)   -i N iter (1000)\n"
+        "  -r N  radio Gauss (15)   -t N hilos (max)\n"
+        "  --no-blur   --no-sobel   --help\n";
 }
-
-static bool parseArgs(int argc, char** argv, Config& cfg) {
+static bool parseArgs(int argc, char** argv, Config& c) {
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
-        auto next = [&](int& out) -> bool {
-            if (i + 1 >= argc) return false;
-            out = std::atoi(argv[++i]);
-            return out > 0;
-        };
-        if (a == "--help") { printHelp(argv[0]); return false; }
-        else if (a == "-w" || a == "--width")   { if (!next(cfg.width))   return false; }
-        else if (a == "-h" || a == "--height")  { if (!next(cfg.height))  return false; }
-        else if (a == "-i" || a == "--iter")    { if (!next(cfg.maxIter)) return false; }
-        else if (a == "-r" || a == "--radius")  { if (!next(cfg.radius))  return false; }
-        else if (a == "-t" || a == "--threads") { if (!next(cfg.threads)) return false; }
-        else if (a == "--no-blur")              { cfg.runBlur  = false; }
-        else if (a == "--no-sobel")             { cfg.runSobel = false; }
-        else {
-            std::cerr << "Argumento desconocido: " << a << "\n";
-            printHelp(argv[0]);
-            return false;
-        }
+        auto nx = [&](int& o){ if (i+1>=argc) return false; o = std::atoi(argv[++i]); return o>0; };
+        if      (a=="--help"){ printHelp(argv[0]); return false; }
+        else if (a=="-w"){ if(!nx(c.width))return false; }
+        else if (a=="-h"){ if(!nx(c.height))return false; }
+        else if (a=="-i"){ if(!nx(c.maxIter))return false; }
+        else if (a=="-r"){ if(!nx(c.radius))return false; }
+        else if (a=="-t"){ if(!nx(c.threads))return false; }
+        else if (a=="--no-blur"){ c.runBlur=false; }
+        else if (a=="--no-sobel"){ c.runSobel=false; }
+        else { std::cerr<<"Arg desconocido: "<<a<<"\n"; printHelp(argv[0]); return false; }
     }
     return true;
 }
 
 // -----------------------------------------------------------------------------
-// 10) MAIN
+// 8) MAIN
 // -----------------------------------------------------------------------------
 int main(int argc, char** argv) {
     using clk = std::chrono::high_resolution_clock;
-    auto ms = [](auto a, auto b) {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
-    };
+    auto ms = [](auto a, auto b){ return std::chrono::duration_cast<std::chrono::milliseconds>(b-a).count(); };
 
     Config cfg;
     if (!parseArgs(argc, argv, cfg)) return 1;
+    if (cfg.threads > 0) omp_set_num_threads(cfg.threads);
 
-    // Configurar numero de hilos (si el usuario lo pidio).
-    if (cfg.threads > 0) {
-        omp_set_num_threads(cfg.threads);
-    }
-
-    // Obtener los hilos que efectivamente se usaran abriendo una region
-    // paralela trivial: omp_get_num_threads() solo da info correcta DENTRO
-    // de una region paralela; fuera, devuelve 1.
     int activeThreads = 1;
     #pragma omp parallel
-    {
+    { 
         #pragma omp single
-        activeThreads = omp_get_num_threads();
+        activeThreads = omp_get_num_threads(); 
     }
 
     std::cout << "============================================================\n";
-    std::cout << " Fractal de Mandelbrot + Convolucion 2D (PARALELO con OpenMP)\n";
+    std::cout << " Mandelbrot + Convolucion 2D (OpenMP + SIMD / SPMD)\n";
     std::cout << "============================================================\n";
-    std::cout << " Resolucion        : " << cfg.width << " x " << cfg.height << "\n";
-    std::cout << " Iter. max         : " << cfg.maxIter << "\n";
-    std::cout << " Radio Gaussiano   : " << cfg.radius
+    std::cout << " Resolucion      : " << cfg.width << " x " << cfg.height << "\n";
+    std::cout << " Radio Gaussiano : " << cfg.radius
               << " (kernel " << (2*cfg.radius+1) << "x" << (2*cfg.radius+1) << ")\n";
-    std::cout << " Aplicar Gaussiana : " << (cfg.runBlur  ? "si" : "no") << "\n";
-    std::cout << " Aplicar Sobel     : " << (cfg.runSobel ? "si" : "no") << "\n";
-#ifdef _OPENMP
-    std::cout << " OpenMP            : ACTIVO (version " << _OPENMP << ")\n";
-    std::cout << " Hilos disponibles : " << omp_get_max_threads() << "\n";
-    std::cout << " Hilos a usar      : " << activeThreads << "\n";
+    std::cout << " Hilos a usar    : " << activeThreads << "\n";
+#ifdef __AVX512F__
+    std::cout << " SIMD compilado  : AVX-512 disponible\n";
+#elif defined(__AVX2__)
+    std::cout << " SIMD compilado  : AVX2 disponible\n";
+#elif defined(__SSE2__)
+    std::cout << " SIMD compilado  : SSE2 disponible\n";
 #else
-    std::cout << " OpenMP            : NO disponible (compilado sin -fopenmp).\n";
-    std::cout << "                     Comportamiento equivalente al secuencial.\n";
+    std::cout << " SIMD compilado  : (sin macro SIMD; revisa -march)\n";
 #endif
     std::cout << "------------------------------------------------------------\n";
 
     Image fractal(cfg.width, cfg.height);
 
-    // ---- Fase 1: Mandelbrot
-    std::cout << "\n[1/3] Generando fractal de Mandelbrot...\n";
+    std::cout << "\n[1/3] Mandelbrot...\n";
     auto t0 = clk::now();
     generateMandelbrot(fractal, cfg.maxIter);
     auto t1 = clk::now();
     long long tMandel = ms(t0, t1);
+    savePPM(fractal, cfg.outFractal);
 
-    std::cout << "      Guardando " << cfg.outFractal << " ...\n";
-    auto t1s = clk::now();
-    if (!savePPM(fractal, cfg.outFractal)) return 2;
-    auto t1e = clk::now();
-    long long tSaveFractal = ms(t1s, t1e);
+    long long tBlur = 0, tSobel = 0, tPad = 0;
 
-    long long tBlur = 0, tSaveBlur = 0;
-    long long tSobel = 0, tSaveSobel = 0;
-
-    // ---- Fase 2: Gaussiana
     if (cfg.runBlur) {
-        std::cout << "\n[2/3] Aplicando desenfoque Gaussiano (r=" << cfg.radius << ")...\n";
+        std::cout << "[2/3] Gaussiana vectorizada (r=" << cfg.radius << ")...\n";
         Image blurred(cfg.width, cfg.height);
-        auto kernel = gaussianKernel(cfg.radius, cfg.radius / 2.0);
+        auto kernel = gaussianKernelF(cfg.radius, cfg.radius / 2.0);
+        auto pa = clk::now();
+        PaddedPlanesF planes(fractal, cfg.radius);   // conversion planar + padding
+        auto pb = clk::now();
+        tPad = ms(pa, pb);
         auto a = clk::now();
-        convolve2D(fractal, blurred, kernel, cfg.radius);
+        convolve2D_simd(planes, blurred, kernel);
         auto b = clk::now();
         tBlur = ms(a, b);
-
-        std::cout << "      Guardando " << cfg.outBlur << " ...\n";
-        auto sa = clk::now();
         savePPM(blurred, cfg.outBlur);
-        auto sb = clk::now();
-        tSaveBlur = ms(sa, sb);
     }
 
-    // ---- Fase 3: Sobel
     if (cfg.runSobel) {
-        std::cout << "\n[3/3] Aplicando filtro Sobel...\n";
+        std::cout << "[3/3] Sobel vectorizado...\n";
         Image edges(cfg.width, cfg.height);
         auto a = clk::now();
-        sobelFilter(fractal, edges);
+        sobel_simd(fractal, edges);
         auto b = clk::now();
         tSobel = ms(a, b);
-
-        std::cout << "      Guardando " << cfg.outSobel << " ...\n";
-        auto sa = clk::now();
         savePPM(edges, cfg.outSobel);
-        auto sb = clk::now();
-        tSaveSobel = ms(sa, sb);
     }
-
-    long long tTotal = tMandel + tSaveFractal + tBlur + tSaveBlur + tSobel + tSaveSobel;
-    long long tCompute = tMandel + tBlur + tSobel;
 
     std::cout << "\n============================================================\n";
-    std::cout << " Tiempos (milisegundos) con " << activeThreads << " hilo(s)\n";
+    std::cout << " Tiempos (ms) con " << activeThreads << " hilo(s)\n";
     std::cout << "------------------------------------------------------------\n";
-    std::cout << "  Mandelbrot          : " << tMandel       << " ms\n";
-    std::cout << "  Guardar fractal     : " << tSaveFractal  << " ms\n";
+    std::cout << "  Mandelbrot              : " << tMandel << " ms\n";
     if (cfg.runBlur) {
-    std::cout << "  Desenfoque Gauss.   : " << tBlur         << " ms\n";
-    std::cout << "  Guardar blurred     : " << tSaveBlur     << " ms\n";
+    std::cout << "  Conversion planar+pad   : " << tPad   << " ms\n";
+    std::cout << "  Gaussiana (SIMD)        : " << tBlur  << " ms\n";
     }
-    if (cfg.runSobel) {
-    std::cout << "  Sobel               : " << tSobel        << " ms\n";
-    std::cout << "  Guardar edges       : " << tSaveSobel    << " ms\n";
-    }
-    std::cout << "------------------------------------------------------------\n";
-    std::cout << "  COMPUTO (sin I/O)   : " << tCompute      << " ms\n";
-    std::cout << "  TOTAL               : " << tTotal        << " ms"
-              << "  (" << (tTotal / 1000.0) << " s)\n";
+    if (cfg.runSobel)
+    std::cout << "  Sobel (SIMD)            : " << tSobel << " ms\n";
     std::cout << "============================================================\n";
-    std::cout << "\n Sugerencia: corre tambien la version secuencial (./fractal)\n"
-                 " con los mismos parametros y compara los tiempos para obtener\n"
-                 " el speedup empirico:  S = t_secuencial / t_paralelo\n";
     return 0;
 }
